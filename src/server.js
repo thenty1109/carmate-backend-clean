@@ -66,44 +66,18 @@ function processResults(
   lng,
   filterRegistered
 ) {
-  // Map Google results with registration status
+  // First create a map of registered centers by google_place_id for quick lookup
+  const registeredMap = new Map();
+  registeredCenters.forEach((rc) => {
+    if (rc.google_place_id) {
+      registeredMap.set(rc.google_place_id, rc);
+    }
+  });
+
+  // Process Google results - only mark as registered if place_id matches exactly
   const processedGoogleResults = googleResults.map((center) => {
-    const isRegistered = registeredCenters.some((rc) => {
-      // 1. Check if place_id matches
-      if (rc.google_place_id === center.place_id) return true;
-
-      // 2. Check name similarity
-      const nameSimilarity = stringSimilarity.compareTwoStrings(
-        rc.service_center_name.toLowerCase(),
-        center.name.toLowerCase()
-      );
-      if (nameSimilarity > 0.8) return true;
-
-      // 3. Check address similarity
-      const addressSimilarity = stringSimilarity.compareTwoStrings(
-        (rc.service_center_address || "").toLowerCase(),
-        (center.vicinity || "").toLowerCase()
-      );
-      if (addressSimilarity > 0.7) return true;
-
-      // 4. Check location proximity (within 100m)
-      if (rc.service_center_lat && rc.service_center_lng) {
-        return (
-          calculateDistance(
-            rc.service_center_lat,
-            rc.service_center_lng,
-            center.geometry?.location.lat,
-            center.geometry?.location.lng
-          ) < 0.1
-        );
-      }
-
-      return false;
-    });
-
-    const registeredCenter = registeredCenters.find(
-      (rc) => rc.google_place_id === center.place_id
-    );
+    const isRegistered = registeredMap.has(center.place_id);
+    const registeredCenter = registeredMap.get(center.place_id);
 
     return {
       id: center.place_id,
@@ -125,7 +99,7 @@ function processResults(
     };
   });
 
-  // Add registered centers not found in Google results
+  // Add all registered centers, even if not found in Google results
   const unmatchedRegisteredCenters = registeredCenters
     .filter(
       (rc) =>
@@ -159,18 +133,15 @@ function processResults(
       source: "supabase",
     }));
 
-  // Combine all results
-  let allResults = [
-    ...unmatchedRegisteredCenters,
-    ...processedGoogleResults.filter((center) => !center.isRegistered),
-  ];
+  // Combine results - now all registered centers will appear
+  let allResults = [...unmatchedRegisteredCenters, ...processedGoogleResults];
 
-  // Apply filter if requested
+  // Only apply filter if explicitly requested
   if (filterRegistered === "true") {
     allResults = allResults.filter((center) => center.isRegistered);
   }
 
-  // Sort results (registered first, then by distance)
+  // Sort with registered first, then by distance
   return allResults.sort((a, b) => {
     if (a.isRegistered && !b.isRegistered) return -1;
     if (!a.isRegistered && b.isRegistered) return 1;
