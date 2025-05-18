@@ -387,10 +387,18 @@ app.post("/create-reminder", async (req, res) => {
 
 // Process Reminders Function
 async function processReminders(testMode = false, testDate = new Date()) {
+  console.log(`Processing reminders between ${testDate} and ${threeDaysLater}`);
+  console.log(`Processing reminders with testDate: ${testDate}`);
+  console.log(
+    `System timezone offset: ${new Date().getTimezoneOffset()} minutes`
+  );
+
   const threeDaysLater = new Date(testDate);
   threeDaysLater.setDate(testDate.getDate() + 3);
 
-  console.log(`Processing reminders between ${testDate} and ${threeDaysLater}`);
+  console.log(
+    `Date range: ${testDate.toISOString()} to ${threeDaysLater.toISOString()}`
+  );
 
   const { data: reminders, error } = await supabase
     .from("reminders")
