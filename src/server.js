@@ -3,6 +3,7 @@ import twilio from "twilio";
 import cors from "cors";
 import "dotenv/config";
 import stringSimilarity from "string-similarity";
+import cron from "node-cron";
 import supabase from "./supabaseServerClient.js";
 import { Client } from "@googlemaps/google-maps-services-js";
 
@@ -35,6 +36,12 @@ const authToken = process.env.VITE_TWILIO_AUTH_TOKEN;
 const twilioPhoneNumber = process.env.VITE_TWILIO_PHONE_NUMBER;
 const client = twilio(accountSid, authToken);
 const googleMapsClient = new Client({});
+
+// Validate Twilio credentials
+if (!accountSid || !authToken || !twilioPhoneNumber) {
+  console.error("Twilio credentials are missing!");
+  process.exit(1);
+}
 
 // Helper function to calculate distance
 function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -241,10 +248,38 @@ app.get("/api/service-centers/nearby", async (req, res) => {
   }
 });
 
+// SMS Templates
+function getUpcomingReminderTemplate(reminder, customer, vehicle) {
+  return (
+    `[CarMate] Service Reminder\n` +
+    `Your ${vehicle.manufacturer} ${vehicle.model} is due for:\n` +
+    `Service: ${reminder.service_type}\n` +
+    `Date: ${new Date(reminder.reminder_date).toLocaleDateString("en-GB")}\n` +
+    (reminder.mileage ? `Recommended Mileage: ${reminder.mileage}km\n` : "")
+  );
+}
+
+function getFollowUpTemplate(reminder, customer, vehicle) {
+  const daysLate = Math.floor(
+    (new Date() - new Date(reminder.reminder_date)) / (1000 * 60 * 60 * 24)
+  );
+
+  return (
+    `[CarMate] Important Follow-up\n` +
+    `We noticed your ${vehicle.manufacturer} ${vehicle.model} missed its scheduled:\n` +
+    `Service: ${reminder.service_type}\n` +
+    `Original Due Date: ${new Date(reminder.reminder_date).toLocaleDateString(
+      "en-GB"
+    )} (${daysLate} day${daysLate !== 1 ? "s" : ""} ago)\n` +
+    `\nDelaying service may affect your vehicle's performance and warranty coverage.\n`
+  );
+}
+
 // SMS Endpoint
 app.post("/api/send-sms", async (req, res) => {
   try {
     const { to, message } = req.body;
+
     if (!to || !message) {
       return res.status(400).json({ error: "Missing phone number or message" });
     }
@@ -261,6 +296,197 @@ app.post("/api/send-sms", async (req, res) => {
     res.status(500).json({
       error: error.message,
       details: error.moreInfo || null,
+    });
+  }
+});
+
+// Reminder Creation Endpoint
+app.post("/create-reminder", async (req, res) => {
+  try {
+    const { customerId, vehicleId, serviceType, reminderDate, mileage, notes } =
+      req.body;
+
+    // Insert reminder
+    const { data: reminder, error } = await supabase
+      .from("reminders")
+      .insert([
+        {
+          user_id: customerId,
+          vehicle_id: vehicleId,
+          service_type: serviceType,
+          reminder_date: reminderDate,
+          mileage: mileage,
+          notes: notes,
+        },
+      ])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Get customer/vehicle details
+    const { data: customer } = await supabase
+      .from("profiles")
+      .select("phone_number, username")
+      .eq("id", customerId)
+      .single();
+
+    const { data: vehicle } = await supabase
+      .from("vehicles")
+      .select("manufacturer, model")
+      .eq("id", vehicleId)
+      .single();
+
+    if (!customer?.phone_number) {
+      throw new Error("Customer phone number not found");
+    }
+
+    // Send confirmation SMS
+    const message =
+      `[CarMate] Service Scheduled\n` +
+      `Hello ${customer.username || "there"},\n` +
+      `Your ${vehicle.manufacturer} ${vehicle.model}\n` +
+      `Service: ${serviceType}\n` +
+      `Scheduled: ${new Date(reminderDate).toLocaleDateString("en-GB")}\n` +
+      (mileage ? `Mileage: ${mileage}km\n` : "");
+
+    await client.messages.create({
+      body: message,
+      from: twilioPhoneNumber,
+      to: customer.phone_number,
+    });
+
+    res.status(201).json({ success: true, reminder });
+  } catch (error) {
+    console.error("Reminder creation error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Process Reminders Function
+async function processReminders(testMode = false, testDate = new Date()) {
+  const threeDaysLater = new Date(testDate);
+  threeDaysLater.setDate(testDate.getDate() + 3);
+
+  console.log(`Processing reminders between ${testDate} and ${threeDaysLater}`);
+
+  const { data: reminders, error } = await supabase
+    .from("reminders")
+    .select(`*, user:user_id (*), vehicle:vehicle_id (*)`)
+    .lte("reminder_date", threeDaysLater.toISOString())
+    .eq("notification_sent", false)
+    .order("reminder_date", { ascending: true });
+
+  if (error) throw error;
+
+  console.log(`Found ${reminders.length} reminders to process`);
+
+  const results = [];
+  for (const reminder of reminders) {
+    try {
+      const reminderDate = new Date(reminder.reminder_date);
+      const daysUntilDue = Math.floor(
+        (reminderDate - testDate) / (1000 * 60 * 60 * 24)
+      );
+
+      let message, templateType;
+      if (daysUntilDue >= 0 && daysUntilDue <= 3) {
+        message = getUpcomingReminderTemplate(
+          reminder,
+          reminder.user,
+          reminder.vehicle
+        );
+        templateType = "upcoming";
+      } else if (daysUntilDue < 0) {
+        message = getFollowUpTemplate(
+          reminder,
+          reminder.user,
+          reminder.vehicle
+        );
+        templateType = "followup";
+      } else {
+        continue;
+      }
+
+      if (testMode) {
+        console.log(`[TEST] Would send to ${reminder.user.phone_number}:`);
+        console.log(message);
+      } else {
+        const result = await client.messages.create({
+          body: message,
+          from: twilioPhoneNumber,
+          to: reminder.user.phone_number,
+        });
+        console.log("Twilio response:", result.sid);
+      }
+
+      if (!testMode) {
+        const { error: updateError } = await supabase
+          .from("reminders")
+          .update({
+            notification_sent: true,
+            last_notification_sent_at: new Date().toISOString(),
+            notification_template_type: templateType,
+          })
+          .eq("id", reminder.id);
+
+        if (updateError) throw updateError;
+      }
+
+      results.push({
+        id: reminder.id,
+        status: "processed",
+        templateType,
+        phone: reminder.user.phone_number,
+        messagePreview: message.substring(0, 50) + "...",
+      });
+    } catch (err) {
+      console.error(`Failed to process reminder ${reminder.id}:`, err);
+      results.push({
+        id: reminder.id,
+        status: "failed",
+        error: err.message,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    remindersProcessed: results.length,
+    results,
+  };
+}
+
+// Scheduled job (runs daily at 9am KL time)
+cron.schedule(
+  "0 9 * * *",
+  () => {
+    console.log("Running scheduled reminder job at", new Date());
+    processReminders(false)
+      .then((result) => console.log("Cron job completed:", result))
+      .catch((err) => console.error("Cron job failed:", err));
+  },
+  {
+    scheduled: true,
+    timezone: "Asia/Kuala_Lumpur",
+  }
+);
+
+// Endpoint to trigger immediate processing
+app.post("/process-reminders", async (req, res) => {
+  try {
+    const { testMode, testDate } = req.body;
+    const currentDate = testDate ? new Date(testDate) : new Date();
+
+    const result = await processReminders(testMode, currentDate);
+    res.json(result);
+  } catch (err) {
+    console.error("Error in process-reminders endpoint:", err);
+    res.status(500).json({
+      error: err.message,
     });
   }
 });
