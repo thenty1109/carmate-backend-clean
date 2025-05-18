@@ -189,6 +189,7 @@ app.get("/api/service-centers/nearby", async (req, res) => {
       searchQuery,
       filterRegistered,
       radius = 10000,
+      maxResults = 60,
     } = req.query;
 
     if (!lat || !lng) {
@@ -197,12 +198,20 @@ app.get("/api/service-centers/nearby", async (req, res) => {
         .json({ error: "Latitude and longitude are required" });
     }
 
+    // Debug: Log incoming coordinates
+    console.log(`Searching near lat: ${lat}, lng: ${lng}, radius: ${radius}m`);
+
     // Get registered centers from Supabase
     const { data: registeredCenters, error: sbError } = await supabase
       .from("service_centers_view")
       .select("*");
 
     if (sbError) throw sbError;
+
+    // Debug: Log registered centers count
+    console.log(
+      `Found ${registeredCenters.length} registered centers in database`
+    );
 
     // Get nearby centers from Google Places API
     const searchParams = {
@@ -211,32 +220,71 @@ app.get("/api/service-centers/nearby", async (req, res) => {
       key: process.env.VITE_GOOGLE_MAPS_API_KEY,
     };
 
+    let allGoogleResults = [];
     let placesResponse;
-    if (searchQuery) {
-      placesResponse = await googleMapsClient.textSearch({
-        params: {
-          ...searchParams,
-          query: `${searchQuery} car service OR auto repair OR vehicle maintenance`,
-        },
-      });
-    } else {
-      placesResponse = await googleMapsClient.placesNearby({
-        params: {
-          ...searchParams,
-          type: "car_repair",
-          keyword: "car service OR auto repair OR vehicle maintenance",
-        },
-      });
+
+    try {
+      if (searchQuery) {
+        placesResponse = await googleMapsClient.textSearch({
+          params: {
+            ...searchParams,
+            query: `${searchQuery} car service OR auto repair OR vehicle maintenance`,
+          },
+        });
+      } else {
+        placesResponse = await googleMapsClient.placesNearby({
+          params: {
+            ...searchParams,
+            type: "car_repair",
+            keyword: "car service OR auto repair OR vehicle maintenance",
+          },
+        });
+      }
+
+      allGoogleResults = placesResponse.data.results;
+
+      // Pagination to get more results if available
+      while (
+        placesResponse.data.next_page_token &&
+        allGoogleResults.length < maxResults
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 2000)); // Required delay
+
+        const nextPageResponse = await googleMapsClient.placesNearby({
+          params: {
+            ...searchParams,
+            pagetoken: placesResponse.data.next_page_token,
+          },
+        });
+
+        allGoogleResults = [
+          ...allGoogleResults,
+          ...nextPageResponse.data.results,
+        ];
+        placesResponse = nextPageResponse;
+      }
+    } catch (googleError) {
+      console.error(
+        "Google Maps API error:",
+        googleError.response?.data || googleError.message
+      );
     }
+
+    // Debug: Log Google results count
+    console.log(`Found ${allGoogleResults.length} Google Places results`);
 
     // Process and return results
     const results = processResults(
       registeredCenters,
-      placesResponse.data.results,
+      allGoogleResults,
       lat,
       lng,
       filterRegistered
     );
+
+    // Debug: Log final results count
+    console.log(`Returning ${results.length} total results`);
+
     res.status(200).json(results);
   } catch (error) {
     console.error("Error:", error);
