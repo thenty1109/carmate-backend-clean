@@ -79,7 +79,7 @@ app.get("/api/service-centers/nearby", async (req, res) => {
     const searchParams = {
       location: { lat: parseFloat(lat), lng: parseFloat(lng) },
       radius: parseInt(radius),
-      key: process.env.GOOGLE_MAPS_API_KEY,
+      key: process.env.VITE_GOOGLE_MAPS_API_KEY,
     };
 
     let placesResponse;
